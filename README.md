@@ -1,4 +1,4 @@
-# Panel NaiveProxy by RIXXX
+# Panel NaiveProxy
 
 > Веб-панель управления для быстрой установки и управления NaiveProxy на VPS
 
