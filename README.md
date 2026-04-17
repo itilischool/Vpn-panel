@@ -7,7 +7,7 @@
 ## 🚀 Быстрая установка панели
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-NaiveProxy-by-RIXXX/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/itilischool/Vpn-panel/main/install.sh)
 ```
 
 После установки панель будет доступна по адресу:
