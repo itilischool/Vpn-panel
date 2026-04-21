@@ -8,6 +8,7 @@ const WebSocket = require('ws');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -16,6 +17,24 @@ const wss = new WebSocket.Server({ server });
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, '../data/config.json');
 const USERS_FILE = path.join(__dirname, '../data/users.json');
+
+// Generate secure session secret on first run
+const SESSION_SECRET_FILE = path.join(__dirname, '../data/.session_secret');
+let SESSION_SECRET = 'naiveproxy-rixxx-secret-2024'; // fallback
+
+function loadSessionSecret() {
+  try {
+    if (fs.existsSync(SESSION_SECRET_FILE)) {
+      SESSION_SECRET = fs.readFileSync(SESSION_SECRET_FILE, 'utf8').trim();
+    } else {
+      SESSION_SECRET = crypto.randomBytes(64).toString('hex');
+      fs.writeFileSync(SESSION_SECRET_FILE, SESSION_SECRET);
+    }
+  } catch (e) {
+    console.error('Warning: Could not load session secret:', e.message);
+  }
+}
+loadSessionSecret();
 
 // Ensure data directory exists
 const dataDir = path.join(__dirname, '../data');
@@ -65,10 +84,15 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(session({
-  secret: 'naiveproxy-rixxx-secret-2024',
+  secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+  cookie: { 
+    secure: false, 
+    maxAge: 24 * 60 * 60 * 1000,
+    httpOnly: true,
+    sameSite: 'lax'
+  }
 }));
 app.use(express.static(path.join(__dirname, '../public')));
 
@@ -77,7 +101,11 @@ function requireAuth(req, res, next) {
   if (req.session && req.session.authenticated) {
     return next();
   }
-  res.status(401).json({ error: 'Unauthorized' });
+  // Return 401 for API requests, redirect for others
+  if (req.path.startsWith('/api')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  res.redirect('/');
 }
 
 // ─────────────────────────────────────────────
@@ -85,12 +113,27 @@ function requireAuth(req, res, next) {
 // ─────────────────────────────────────────────
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
+  
+  if (!username || !password) {
+    return res.json({ success: false, message: 'Введите логин и пароль' });
+  }
+  
   const users = loadUsers();
   const user = users[username];
-  if (!user) return res.json({ success: false, message: 'Неверный логин или пароль' });
-  if (!bcrypt.compareSync(password, user.password)) {
+  
+  if (!user) {
     return res.json({ success: false, message: 'Неверный логин или пароль' });
   }
+  
+  try {
+    if (!bcrypt.compareSync(password, user.password)) {
+      return res.json({ success: false, message: 'Неверный логин или пароль' });
+    }
+  } catch (e) {
+    console.error('Login error:', e);
+    return res.json({ success: false, message: 'Ошибка аутентификации' });
+  }
+  
   req.session.authenticated = true;
   req.session.username = username;
   req.session.role = user.role;
@@ -196,14 +239,19 @@ app.delete('/api/proxy-users/:username', requireAuth, (req, res) => {
 // ─────────────────────────────────────────────
 app.get('/api/status', requireAuth, (req, res) => {
   const config = loadConfig();
+  
   if (!config.installed) {
     return res.json({ installed: false, status: 'not_installed' });
   }
   
   const child = spawn('systemctl', ['is-active', 'caddy']);
   let output = '';
+  let stderr = '';
+  
   child.stdout.on('data', d => output += d.toString().trim());
-  child.on('close', () => {
+  child.stderr.on('data', d => stderr += d.toString());
+  
+  child.on('close', (code) => {
     const running = output.trim() === 'active';
     res.json({
       installed: true,
@@ -214,22 +262,50 @@ app.get('/api/status', requireAuth, (req, res) => {
       usersCount: (config.proxyUsers || []).length
     });
   });
-  child.on('error', () => {
-    res.json({ installed: config.installed, status: 'unknown', domain: config.domain });
+  
+  child.on('error', (err) => {
+    console.error('Status check error:', err);
+    res.json({ 
+      installed: config.installed, 
+      status: 'unknown', 
+      domain: config.domain,
+      error: 'Failed to check service status'
+    });
   });
 });
 
 app.post('/api/service/:action', requireAuth, (req, res) => {
   const { action } = req.params;
+  
   if (!['start', 'stop', 'restart'].includes(action)) {
     return res.status(400).json({ error: 'Invalid action' });
   }
+  
   const child = spawn('systemctl', [action, 'caddy']);
+  let stderr = '';
+  
+  child.stderr.on('data', d => stderr += d.toString());
+  
   child.on('close', (code) => {
-    res.json({ success: code === 0, message: code === 0 ? `Caddy ${action} выполнен` : 'Ошибка управления сервисом' });
+    if (code === 0) {
+      res.json({ success: true, message: `Caddy ${action}ed successfully` });
+    } else {
+      console.error(`Service ${action} failed:`, stderr);
+      res.status(500).json({ 
+        success: false, 
+        message: `Failed to ${action} Caddy service`,
+        error: stderr.trim() || 'Unknown error'
+      });
+    }
   });
-  child.on('error', () => {
-    res.json({ success: false, message: 'systemctl недоступен (вы не на сервере?)' });
+  
+  child.on('error', (err) => {
+    console.error(`Service ${action} error:`, err);
+    res.status(500).json({ 
+      success: false, 
+      message: 'systemctl unavailable or permission denied',
+      error: err.message
+    });
   });
 });
 
@@ -283,7 +359,9 @@ ${basicAuthLines}
 
   try {
     fs.writeFileSync('/etc/caddy/Caddyfile', caddyfileContent, 'utf8');
+    console.log('Caddyfile updated successfully');
   } catch (e) {
+    console.error('Failed to write Caddyfile:', e.message);
     // Not running as root or Caddy not installed — skip silently
   }
 
@@ -291,8 +369,16 @@ ${basicAuthLines}
   const reload = spawn('bash', ['-c',
     'caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || systemctl restart caddy 2>/dev/null || true'
   ]);
-  reload.on('close', () => { if (callback) callback(); });
-  reload.on('error', () => { if (callback) callback(); });
+  
+  reload.on('close', () => { 
+    console.log('Caddy reload attempted');
+    if (callback) callback(); 
+  });
+  
+  reload.on('error', (err) => { 
+    console.error('Caddy reload error:', err);
+    if (callback) callback(); 
+  });
 }
 
 function handleInstall(ws, data) {
@@ -419,8 +505,30 @@ function parseLogLine(line) {
 // Serve index for all non-api routes (SPA)
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
-    res.sendFile(path.join(__dirname, '../public/index.html'));
+    const indexPath = path.join(__dirname, '../public/index.html');
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      res.status(404).send('Frontend not found. Please ensure the panel is properly installed.');
+    }
   }
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
@@ -428,4 +536,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`║   Panel NaiveProxy by RIXXX          ║`);
   console.log(`║   Running on http://0.0.0.0:${PORT}     ║`);
   console.log(`╚══════════════════════════════════════╝\n`);
+  
+  // Check if running as root (warning)
+  if (process.getuid && process.getuid() === 0) {
+    console.warn('⚠️  WARNING: Running as root is not recommended for production!');
+  }
 });

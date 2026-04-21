@@ -1,0 +1,7 @@
+# Ignore runtime config files
+config.json
+users.json
+.session_secret
+
+# Logs
+*.log
